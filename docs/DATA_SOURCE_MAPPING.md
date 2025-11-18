@@ -1,1706 +1,1041 @@
-# Chi Tiết Nguồn Dữ Liệu và Mapping Rules
+# Chi Tiết Nguồn Dữ Liệu Theo Division
 
-## Mục Lục
-1. [Time Series Mapping](#1-time-series-mapping)
-2. [Channel Mapping](#2-channel-mapping)
-3. [Period/Column Mapping](#3-periodcolumn-mapping)
-4. [Calculation Fields Mapping](#4-calculation-fields-mapping)
-5. [Budget Fields Mapping](#5-budget-fields-mapping)
-6. [Master Data Fields Mapping](#6-master-data-fields-mapping)
-7. [Complete Mapping Matrix](#7-complete-mapping-matrix)
+## 📋 Mục Lục
+
+1. [Giới Thiệu](#1-giới-thiệu)
+2. [Cấu Trúc Dữ Liệu Chung](#2-cấu-trúc-dữ-liệu-chung)
+3. [CPD Division](#3-cpd-division)
+4. [LDB Division](#4-ldb-division)
+5. [LLD Division](#5-lld-division)
+6. [Calculation Fields](#6-calculation-fields)
+7. [Complete Matrix](#7-complete-mapping-matrix)
 
 ---
 
-## 1. Time Series Mapping
+## 1. Giới Thiệu
 
-### 1.1. Baseline Qty (1. Baseline Qty)
+Tài liệu này mô tả **chi tiết nguồn dữ liệu** cho từng field trong hệ thống Forecasting Tool, phân chia theo:
+- **Division**: CPD, LDB, LLD
+- **Data Type**: Historical (quá khứ) vs Forecast (dự báo)
+- **Business Type**: Sell-In (SI) vs Sell-Out (SO)
+- **Measure Type**: Unit vs Value
 
-**Nguồn dữ liệu chính:**
+---
 
-| Source | Table/File | Condition | Priority |
-|--------|------------|-----------|----------|
-| Historical SO | `Historical_SO` | `Order_Type = 'ZOR'` (Normal Order) | Primary for historical |
-| User Input | `WF_Master` (Excel) | Manual forecast input | Primary for forecast |
-| M-1 Forecast | `FC_FM_History` | Previous month forecast | Reference only |
+## 2. Cấu Trúc Dữ Liệu Chung
 
-**Mapping Logic:**
+### 2.1. Phân Loại Dữ Liệu
+
+```
+Division (CPD / LDB / LLD)
+│
+├─ HISTORICAL (Quá khứ - Read Only)
+│  ├─ Sell-Out (SO) - Bán từ retailers → end customers
+│  │  ├─ Unit (số lượng)
+│  │  └─ Value (giá trị)
+│  │
+│  └─ Sell-In (SI) - Bán từ L'Oréal → retailers
+│     ├─ Unit (số lượng)
+│     └─ Value (giá trị)
+│
+└─ FORECAST (Dự báo - Editable)
+   ├─ Sell-Out (SO) - Dự báo SO
+   │  ├─ Unit
+   │  └─ Value
+   │
+   └─ Sell-In (SI) - Dự báo SI
+      ├─ Unit
+      └─ Value
+```
+
+### 2.2. Nguồn Files
+
+**Tất cả stored procedures và views nằm trong:**
+```
+./Script/1. FINAL/0. link_37/          ← Import procedures
+./Script/1. FINAL/1. Action/           ← Processing procedures
+./Script/1. FINAL/3. Function/         ← Business logic functions
+./Script/1. FINAL/4. View/             ← Data views
+```
+
+---
+
+## 3. CPD Division
+
+### 3.1. HISTORICAL DATA
+
+#### 3.1.1. Historical Sell-Out (SO) - Unit
+
+**Nguồn Dữ Liệu:**
+
+| Source | File/Procedure | Table | Path |
+|--------|----------------|-------|------|
+| **Optimus System** | `sp_add_FC_SO_OPTIMUS_NORMAL_Tmp.sql` | `FC_SO_OPTIMUS_NORMAL_CPD` | `\Pending\OPTIMUS\SELL OUT NORMAL\CPD\` |
+| **Processed** | `sp_Run_SO_HIS_FULL.sql` | `FC_CPD_SO_HIS_FINAL` | - |
+| **Final View** | `fnc_FC_SO_HIS_FINAL('CPD')` | Function output | - |
+
+**Rule Mapping:**
 
 ```sql
--- HISTORICAL DATA (Y-2, Y-1, past Y0)
--- Source: SAP Sell-Out data via Optimus
+-- From sp_Run_SO_HIS_FULL
+-- Step 1: Import từ Optimus Excel files
+EXEC sp_add_FC_SO_OPTIMUS_NORMAL_Tmp
+    @Division = 'CPD',
+    @filename = 'SELLOUT_CPD_YYYYMMDD.xlsx'
+
+-- Step 2: Process và aggregate
+INSERT INTO FC_CPD_SO_HIS_FINAL
 SELECT
-    sm.Sub_Group,
-    CASE
-        WHEN cm.Channel IN ('GT', 'MT', 'PHARMA', 'SALON') THEN 'OFFLINE'
-        WHEN cm.Channel = 'ONLINE' THEN 'ONLINE'
+    Barcode,
+    PeriodKey = CONCAT(YEAR([Date]), RIGHT('0' + CAST(MONTH([Date]) AS VARCHAR), 2)),
+    Channel = CASE
+        WHEN Customer_Channel IN ('GT', 'MT', 'PHARMA') THEN 'OFFLINE'
+        WHEN Customer_Channel = 'ONLINE' THEN 'ONLINE'
         ELSE 'OFFLINE'
-    END AS Channel,
-    '1. Baseline Qty' AS Time_Series,
-    DATEFROMPARTS(YEAR(so.Month), MONTH(so.Month), 1) AS Period,
-    SUM(so.SO_Qty) AS Quantity
-FROM Historical_SO so
-INNER JOIN Spectrum_Master sm ON so.Material = sm.Spectrum
-INNER JOIN Customer_Master cm ON so.Customer_Code = cm.Customer_Code
-WHERE so.Order_Type = 'ZOR'  -- Normal orders only
-  AND so.Status = 'C'  -- Completed orders only
-  AND sm.Division = @Division
-  AND sm.Status = 'ACTIVE'
-  -- Exclude promotional periods
-  AND NOT EXISTS (
-      SELECT 1 FROM Promo_Calendar pc
-      WHERE pc.Sub_Group = sm.Sub_Group
-        AND so.Month BETWEEN pc.Start_Date AND pc.End_Date
-  )
-GROUP BY sm.Sub_Group,
-         CASE WHEN cm.Channel IN ('GT', 'MT', 'PHARMA', 'SALON') THEN 'OFFLINE'
-              WHEN cm.Channel = 'ONLINE' THEN 'ONLINE'
-              ELSE 'OFFLINE' END,
-         YEAR(so.Month), MONTH(so.Month)
+    END,
+    SellOut = SUM([Quantity Unit]),  ← SO Unit
+    SellOutValue = SUM([Quantity Value]),
+    ...
+FROM FC_SO_OPTIMUS_NORMAL_CPD
+WHERE Division = 'CPD'
+  AND [Date] >= DATEADD(MONTH, -24, GETDATE())  ← Last 24 months
+GROUP BY Barcode, YEAR([Date]), MONTH([Date]), Channel
 ```
 
-**Filtering Rules:**
+**Filters:**
+- ✅ Division = 'CPD'
+- ✅ Date range: Last 24 months (Y-2, Y-1, past Y0)
+- ✅ Status = Active products only
+- ✅ Exclude: Internal transfers, returns
 
-✅ **Include:**
-- Order_Type = 'ZOR' (Normal orders)
-- Status = 'C' (Completed)
-- Active products only
-- Non-promotional periods
-
-❌ **Exclude:**
-- ZPROMO, ZLAUNCH, ZFOC orders
-- Cancelled/returned orders (Status <> 'C')
-- Promotional periods (có trong Promo_Calendar)
-- Inactive products
-- Internal transfers
+**Output Columns:**
+- `[Y-2 (u) M1]` to `[Y-2 (u) M12]` ← Unit data for 2 years ago
+- `[Y-1 (u) M1]` to `[Y-1 (u) M12]` ← Unit data for last year
+- `[Y0 (u) M1]` to `[Y0 (u) Mcurrent]` ← Unit data for current year (past months)
 
 **Example:**
-
 ```
-Input (Historical_SO):
-Material: 3600542410311
-Customer: 1000123 (CO.OP MART → OFFLINE)
-Order_Type: ZOR
-Month: 2024-01-01
-SO_Qty: 1500 units
-Status: C
-
-↓ Mapping ↓
-
-Output (WF Historical):
-Forecasting Line: LOP Revitalift Cream (from Spectrum_Master)
+Barcode: 3600542410311
+Period: 202401 (Jan 2024)
 Channel: OFFLINE
-Time series: 1. Baseline Qty
-[Y-1 (u) M1]: 1500 (aggregated by Sub_Group + Channel + Month)
-```
-
-**Forecast Data (Current & Future):**
-
-```
-Source: User manual input in WF Excel sheet
-
-User enters directly:
-Forecasting Line: LOP Revitalift Cream
-Channel: ONLINE
-Time series: 1. Baseline Qty
-[Y0 (u) M2]: 5000 (user forecast for Feb 2025)
-[Y0 (u) M3]: 5200 (user forecast for Mar 2025)
-...
+SellOut: 1500 units
+→ Mapped to WF column: [Y-1 (u) M1] = 1500
 ```
 
 ---
 
-### 1.2. Promo Qty (2. Promo Qty)
+#### 3.1.2. Historical Sell-Out (SO) - Value
 
-**Nguồn dữ liệu chính:**
+**Nguồn Dữ Liệu:**
 
-| Source | Table/File | Condition | Priority |
-|--------|------------|-----------|----------|
-| Historical SO | `Historical_SO` | `Order_Type = 'ZPROMO'` OR in Promo_Calendar | Primary for historical |
-| Promo Calendar | `Promo_Calendar` | Confirmed promos | Planning reference |
-| User Input | `WF_Master` (Excel) | Manual promo forecast | Primary for forecast |
+Same source as Unit, but using Value fields.
 
-**Mapping Logic:**
+**Rule Mapping:**
 
 ```sql
--- HISTORICAL PROMO DATA
--- Method 1: By Order Type
 SELECT
-    sm.Sub_Group,
-    CASE
-        WHEN cm.Channel IN ('GT', 'MT', 'PHARMA', 'SALON') THEN 'OFFLINE'
-        WHEN cm.Channel = 'ONLINE' THEN 'ONLINE'
-        ELSE 'OFFLINE'
-    END AS Channel,
-    '2. Promo Qty' AS Time_Series,
-    DATEFROMPARTS(YEAR(so.Month), MONTH(so.Month), 1) AS Period,
-    SUM(so.SO_Qty) AS Quantity
-FROM Historical_SO so
-INNER JOIN Spectrum_Master sm ON so.Material = sm.Spectrum
-INNER JOIN Customer_Master cm ON so.Customer_Code = cm.Customer_Code
-WHERE so.Order_Type = 'ZPROMO'  -- Promo orders
-  AND so.Status = 'C'
-  AND sm.Division = @Division
-  AND sm.Status = 'ACTIVE'
-GROUP BY sm.Sub_Group,
-         CASE WHEN cm.Channel IN ('GT', 'MT', 'PHARMA', 'SALON') THEN 'OFFLINE'
-              WHEN cm.Channel = 'ONLINE' THEN 'ONLINE'
-              ELSE 'OFFLINE' END,
-         YEAR(so.Month), MONTH(so.Month)
-
-UNION ALL
-
--- Method 2: By Promo Calendar (for ZOR orders during promo period)
-SELECT
-    sm.Sub_Group,
-    CASE
-        WHEN cm.Channel IN ('GT', 'MT', 'PHARMA', 'SALON') THEN 'OFFLINE'
-        WHEN cm.Channel = 'ONLINE' THEN 'ONLINE'
-        ELSE 'OFFLINE'
-    END AS Channel,
-    '2. Promo Qty' AS Time_Series,
-    DATEFROMPARTS(YEAR(so.Month), MONTH(so.Month), 1) AS Period,
-    SUM(so.SO_Qty) AS Quantity
-FROM Historical_SO so
-INNER JOIN Spectrum_Master sm ON so.Material = sm.Spectrum
-INNER JOIN Customer_Master cm ON so.Customer_Code = cm.Customer_Code
-INNER JOIN Promo_Calendar pc ON sm.Sub_Group = pc.Sub_Group
-    AND so.Month BETWEEN pc.Start_Date AND pc.End_Date
-WHERE so.Order_Type = 'ZOR'  -- Normal orders but in promo period
-  AND so.Status = 'C'
-  AND sm.Division = @Division
-  AND pc.Status = 'CONFIRMED'
-GROUP BY sm.Sub_Group,
-         CASE WHEN cm.Channel IN ('GT', 'MT', 'PHARMA', 'SALON') THEN 'OFFLINE'
-              WHEN cm.Channel = 'ONLINE' THEN 'ONLINE'
-              ELSE 'OFFLINE' END,
-         YEAR(so.Month), MONTH(so.Month)
+    ...
+    SellOut = SUM([Quantity Unit]),
+    SellOutValue = SUM([Quantity Value])  ← SO Value (VND)
+FROM FC_SO_OPTIMUS_NORMAL_CPD
 ```
 
-**Filtering Rules:**
-
-✅ **Include:**
-- Order_Type = 'ZPROMO' (explicit promo orders)
-- OR (Order_Type = 'ZOR' AND order date within Promo_Calendar period)
-- Status = 'C' (Completed)
-- Confirmed promotional campaigns only
-
-❌ **Exclude:**
-- Non-promo orders outside promo periods
-- Test/trial promos (Status = 'DRAFT')
-
-**Promo Calendar Reference:**
-
-```sql
--- Promo Calendar table structure
-CREATE TABLE Promo_Calendar (
-    Promo_ID VARCHAR(20) PRIMARY KEY,
-    Promo_Name NVARCHAR(200),
-    Division VARCHAR(3),
-    Sub_Group VARCHAR(100),
-    Channel VARCHAR(20),  -- ONLINE, OFFLINE, or NULL (both)
-    Start_Date DATE,
-    End_Date DATE,
-    Promo_Type VARCHAR(50),  -- Trade Promo, Consumer Promo, Flash Sale, etc.
-    Expected_Uplift_Pct DECIMAL(5,2),  -- Expected sales uplift %
-    Status VARCHAR(20)  -- DRAFT, CONFIRMED, COMPLETED, CANCELLED
-)
-
--- Example records:
-INSERT INTO Promo_Calendar VALUES
-('PROMO_2025_01_TET', 'Tet Campaign 2025', 'CPD', 'LOP Revitalift Cream', NULL,
- '2025-01-15', '2025-02-15', 'Seasonal Campaign', 30.0, 'CONFIRMED'),
-('PROMO_2025_02_FLASH', 'Shopee Flash Sale', 'CPD', 'LOP UV Perfect', 'ONLINE',
- '2025-02-08', '2025-02-10', 'Flash Sale', 50.0, 'CONFIRMED')
+**Calculation:**
+```
+Value = Unit × Price
+Price = From price list or actual transaction price
+Currency: VND (Vietnamese Dong)
 ```
 
-**Example:**
-
-```
-Scenario 1: Explicit Promo Order
-Input (Historical_SO):
-Material: 3600542410311
-Customer: 1000123
-Order_Type: ZPROMO  ← Direct promo order
-Month: 2024-02-01
-SO_Qty: 2000 units
-
-↓ Mapping ↓
-
-Output (WF Historical):
-Forecasting Line: LOP Revitalift Cream
-Channel: OFFLINE
-Time series: 2. Promo Qty
-[Y-1 (u) M2]: 2000
-
-
-Scenario 2: Normal Order During Promo Period
-Input (Historical_SO):
-Material: 3600542410311
-Order_Type: ZOR  ← Normal order
-Month: 2024-02-05
-
-Promo_Calendar:
-Promo_ID: PROMO_2024_02_TET
-Sub_Group: LOP Revitalift Cream
-Start_Date: 2024-02-01
-End_Date: 2024-02-29
-Status: CONFIRMED
-
-↓ Mapping ↓
-
-Since order date (2024-02-05) falls within promo period:
-Output (WF Historical):
-Time series: 2. Promo Qty
-[Y-1 (u) M2]: +sales (added to promo qty)
-```
-
-**Forecast Data:**
-
-```
-Source: Promo_Calendar + User adjustment
-
-Step 1: System suggests promo forecast based on:
-- Historical promo performance
-- Expected_Uplift_Pct from Promo_Calendar
-- Baseline forecast
-
-Calculation:
-Suggested_Promo_Qty = Baseline_Qty × (Expected_Uplift_Pct / 100)
-
-Example:
-Baseline Qty (Feb 2025): 10000 units
-Expected Uplift: 30%
-Suggested Promo Qty: 10000 × 0.3 = 3000 units
-
-Step 2: User reviews and adjusts:
-Forecasting Line: LOP Revitalift Cream
-Channel: OFFLINE
-Time series: 2. Promo Qty
-[Y0 (u) M2]: 3500 (user adjusted from 3000 suggestion)
-```
+**Output Columns:**
+- `[(Value)_Y-2 (u) M1]` to `[(Value)_Y-2 (u) M12]`
+- `[(Value)_Y-1 (u) M1]` to `[(Value)_Y-1 (u) M12]`
+- `[(Value)_Y0 (u) M1]` to `[(Value)_Y0 (u) Mcurrent]`
 
 ---
 
-### 1.3. Launch Qty (4. Launch Qty)
+#### 3.1.3. Historical Sell-In (SI) - Unit
 
-**Nguồn dữ liệu chính:**
+**Nguồn Dữ Liệu:**
 
-| Source | Table/File | Condition | Priority |
-|--------|------------|-----------|----------|
-| Historical SO | `Historical_SO` | `Order_Type = 'ZLAUNCH'` OR within 3M of Launch_Date | Primary for historical |
-| Spectrum Master | `Spectrum_Master` | `Launch_Date` field | Launch period detection |
-| User Input | `WF_Master` (Excel) | Manual launch forecast | Primary for forecast |
+| Source | File/Procedure | Table | Path |
+|--------|----------------|-------|------|
+| **SAP ZV14** | `sp_add_FC_SI_OPTIMUS_NORMAL_Tmp.sql` | `FC_SI_OPTIMUS_NORMAL_CPD` | `\Pending\ZV14\CPD\` |
+| **Processed** | Views: `V_CPD_His_SI_*` | Multiple SI views | - |
 
-**Mapping Logic:**
+**Rule Mapping:**
 
 ```sql
--- HISTORICAL LAUNCH DATA
--- Method 1: By Order Type
+-- Import from SAP ZV14
+EXEC sp_add_FC_SI_OPTIMUS_NORMAL_Tmp
+    @Division = 'CPD',
+    @filename = 'ZV14_CPD_YYYYMMDD.xlsx'
+
+-- Process SI historical
 SELECT
-    sm.Sub_Group,
-    CASE
-        WHEN cm.Channel IN ('GT', 'MT', 'PHARMA', 'SALON') THEN 'OFFLINE'
-        WHEN cm.Channel = 'ONLINE' THEN 'ONLINE'
-        ELSE 'OFFLINE'
-    END AS Channel,
-    '4. Launch Qty' AS Time_Series,
-    DATEFROMPARTS(YEAR(so.Month), MONTH(so.Month), 1) AS Period,
-    SUM(so.SO_Qty) AS Quantity
-FROM Historical_SO so
-INNER JOIN Spectrum_Master sm ON so.Material = sm.Spectrum
-INNER JOIN Customer_Master cm ON so.Customer_Code = cm.Customer_Code
-WHERE so.Order_Type = 'ZLAUNCH'  -- Launch orders
-  AND so.Status = 'C'
-  AND sm.Division = @Division
-GROUP BY sm.Sub_Group,
-         CASE WHEN cm.Channel IN ('GT', 'MT', 'PHARMA', 'SALON') THEN 'OFFLINE'
-              WHEN cm.Channel = 'ONLINE' THEN 'ONLINE'
-              ELSE 'OFFLINE' END,
-         YEAR(so.Month), MONTH(so.Month)
-
-UNION ALL
-
--- Method 2: By Launch Date (first 3 months after launch)
-SELECT
-    sm.Sub_Group,
-    CASE
-        WHEN cm.Channel IN ('GT', 'MT', 'PHARMA', 'SALON') THEN 'OFFLINE'
-        WHEN cm.Channel = 'ONLINE' THEN 'ONLINE'
-        ELSE 'OFFLINE'
-    END AS Channel,
-    '4. Launch Qty' AS Time_Series,
-    DATEFROMPARTS(YEAR(so.Month), MONTH(so.Month), 1) AS Period,
-    SUM(so.SO_Qty) AS Quantity
-FROM Historical_SO so
-INNER JOIN Spectrum_Master sm ON so.Material = sm.Spectrum
-INNER JOIN Customer_Master cm ON so.Customer_Code = cm.Customer_Code
-WHERE so.Order_Type IN ('ZOR', 'ZPROMO')  -- Normal/Promo orders during launch period
-  AND so.Status = 'C'
-  AND sm.Launch_Date IS NOT NULL
-  -- Within 3 months of launch
-  AND so.Month >= sm.Launch_Date
-  AND so.Month < DATEADD(MONTH, 3, sm.Launch_Date)
-  AND sm.Division = @Division
-GROUP BY sm.Sub_Group,
-         CASE WHEN cm.Channel IN ('GT', 'MT', 'PHARMA', 'SALON') THEN 'OFFLINE'
-              WHEN cm.Channel = 'ONLINE' THEN 'ONLINE'
-              ELSE 'OFFLINE' END,
-         YEAR(so.Month), MONTH(so.Month)
+    Material,
+    PeriodKey = FORMAT(Delivery_Date, 'yyyyMM'),
+    Channel = CASE
+        WHEN Customer_Type IN ('GT', 'MT') THEN 'OFFLINE'
+        WHEN Customer_Type = 'ONLINE' THEN 'ONLINE'
+    END,
+    SellIn_Unit = SUM(Delivery_Quantity)  ← SI Unit
+FROM FC_SI_OPTIMUS_NORMAL_CPD
+WHERE Order_Status = 'C'  ← Completed only
+  AND Order_Type NOT IN ('ZRET', 'ZCAN')  ← Exclude returns/cancelled
+GROUP BY Material, FORMAT(Delivery_Date, 'yyyyMM'), Channel
 ```
 
-**Launch Period Rules:**
+**Filters:**
+- ✅ Order_Status = 'C' (Completed)
+- ✅ Order_Type ≠ Return/Cancelled
+- ✅ Division = 'CPD'
+- ✅ Delivery_Date trong last 24 months
 
-```
-Launch Period = 3 months from Launch_Date
-
-Example:
-Product: LOP New Serum
-Launch_Date: 2024-06-01
-
-Launch Period:
-- Month 1 (M0): Jun 2024 → 4. Launch Qty
-- Month 2 (M1): Jul 2024 → 4. Launch Qty
-- Month 3 (M2): Aug 2024 → 4. Launch Qty
-- Month 4+ (M3+): Sep 2024 onwards → 1. Baseline Qty (graduated to baseline)
-```
-
-**Filtering Rules:**
-
-✅ **Include:**
-- Order_Type = 'ZLAUNCH' (explicit launch orders)
-- OR within 3 months of Launch_Date (from Spectrum_Master)
-- New products (Launch_Date within last 24 months)
-
-❌ **Exclude:**
-- Orders beyond 3-month launch window
-- Products without Launch_Date (legacy products)
-
-**Example:**
-
-```
-Scenario: New Product Launch
-
-Spectrum_Master:
-Spectrum: 3600542499999
-Product_Name: LOP New Anti-Aging Serum 2025
-Sub_Group: LOP New Serum
-Launch_Date: 2025-01-15
-Status: ACTIVE
-
-Input (Historical_SO):
-Material: 3600542499999
-Month: 2025-02-01 (within 3 months of launch)
-Order_Type: ZOR
-SO_Qty: 800 units
-
-↓ Mapping Logic ↓
-
-Check launch period:
-Launch_Date: 2025-01-15
-Order_Month: 2025-02-01
-Months_Since_Launch: 0 (same month as launch is M0)
-→ Within launch period (< 3 months)
-
-↓ Mapping ↓
-
-Output (WF Historical):
-Forecasting Line: LOP New Serum
-Channel: OFFLINE
-Time series: 4. Launch Qty  ← Mapped to Launch Qty
-[Y0 (u) M2]: 800
-```
-
-**Forecast Data:**
-
-```
-Source: Launch Plan + User input
-
-Launch Plan Table:
-CREATE TABLE Launch_Plan (
-    Launch_ID VARCHAR(20) PRIMARY KEY,
-    Division VARCHAR(3),
-    Sub_Group VARCHAR(100),
-    Launch_Date DATE,
-    Launch_Qty_M0 INT,  -- Expected qty month 0
-    Launch_Qty_M1 INT,  -- Expected qty month 1
-    Launch_Qty_M2 INT,  -- Expected qty month 2
-    Channel_Split_Online_Pct DECIMAL(5,2)
-)
-
-Example:
-INSERT INTO Launch_Plan VALUES
-('LAUNCH_2025_NEW_SERUM', 'CPD', 'LOP New Serum', '2025-03-01',
- 5000, 8000, 10000, 40.0)  -- 40% ONLINE, 60% OFFLINE
-
-System suggestion for forecast:
-Forecasting Line: LOP New Serum
-Channel: ONLINE
-Time series: 4. Launch Qty
-[Y0 (u) M3]: 5000 × 40% = 2000  (M0, suggested)
-[Y0 (u) M4]: 8000 × 40% = 3200  (M1, suggested)
-[Y0 (u) M5]: 10000 × 40% = 4000 (M2, suggested)
-[Y0 (u) M6]: 0 (M3+, no longer launch period)
-
-User can adjust these suggestions
-```
+**Special Rules CPD:**
+- **Single products**: Direct SI from ZV14
+- **BOM products**: SI = Sum of component SI
+- **FOC (Free of Charge)**: Tách riêng time series `5. FOC Qty`
 
 ---
 
-### 1.4. FOC Qty (5. FOC Qty - Free of Charge)
+#### 3.1.4. Historical Sell-In (SI) - Value
 
-**Nguồn dữ liệu chính:**
+**Nguồn Dữ Liệu:**
 
-| Source | Table/File | Condition | Priority |
-|--------|------------|-----------|----------|
-| Historical SO | `Historical_SO` | `Order_Type = 'ZFOC'` | Primary for historical |
-| Promo Calendar | `Promo_Calendar` | FOC campaigns | Planning reference |
-| User Input | `WF_Master` (Excel) | Manual FOC forecast | Primary for forecast |
+Same source, using value fields from ZV14.
 
-**Mapping Logic:**
+**Rule Mapping:**
 
 ```sql
--- HISTORICAL FOC DATA
 SELECT
-    sm.Sub_Group,
-    CASE
-        WHEN cm.Channel IN ('GT', 'MT', 'PHARMA', 'SALON') THEN 'OFFLINE'
-        WHEN cm.Channel = 'ONLINE' THEN 'ONLINE'
-        ELSE 'OFFLINE'
-    END AS Channel,
-    '5. FOC Qty' AS Time_Series,
-    DATEFROMPARTS(YEAR(so.Month), MONTH(so.Month), 1) AS Period,
-    SUM(so.SO_Qty) AS Quantity
-FROM Historical_SO so
-INNER JOIN Spectrum_Master sm ON so.Material = sm.Spectrum
-INNER JOIN Customer_Master cm ON so.Customer_Code = cm.Customer_Code
-WHERE so.Order_Type = 'ZFOC'  -- FOC orders only
-  AND so.Status = 'C'
-  AND sm.Division = @Division
-  AND sm.Status = 'ACTIVE'
-GROUP BY sm.Sub_Group,
-         CASE WHEN cm.Channel IN ('GT', 'MT', 'PHARMA', 'SALON') THEN 'OFFLINE'
-              WHEN cm.Channel = 'ONLINE' THEN 'ONLINE'
-              ELSE 'OFFLINE' END,
-         YEAR(so.Month), MONTH(so.Month)
+    SellIn_Unit = SUM(Delivery_Quantity),
+    SellIn_Value = SUM(Delivery_Quantity * Unit_Price)  ← SI Value
+FROM FC_SI_OPTIMUS_NORMAL_CPD
 ```
 
-**Filtering Rules:**
-
-✅ **Include:**
-- Order_Type = 'ZFOC' (Free of Charge)
-- Status = 'C' (Completed)
-- Samples, gifts, promotional giveaways
-
-❌ **Exclude:**
-- Paid orders
-- Internal stock movements
-
-**FOC Types:**
-
-| FOC Type | Description | Example |
-|----------|-------------|---------|
-| **Sampling** | Product samples for trial | LOP Sample 5ml |
-| **Gift with Purchase** | Free product when buying | Buy 2 Get 1 Free |
-| **Promotional Gift** | Marketing campaign giveaway | LOP Tote Bag (free) |
-| **Trade FOC** | Free goods for retailers | Trade incentive stock |
-
-**Example:**
-
-```
-Input (Historical_SO):
-Material: 3600542410999 (LOP Sample 5ml)
-Product_Type: Sample (from Spectrum_Master)
-Customer: 2000456
-Order_Type: ZFOC  ← Free of charge
-Month: 2024-03-01
-SO_Qty: 5000 units (samples)
-Status: C
-
-↓ Mapping ↓
-
-Output (WF Historical):
-Forecasting Line: LOP Revitalift Cream (main product line)
-Channel: ONLINE
-Time series: 5. FOC Qty
-[Y-1 (u) M3]: 5000
-```
-
-**Forecast Data:**
-
-```
-Source: Marketing Campaign Plan + User input
-
-FOC is typically planned based on:
-1. Sampling campaigns (new product launches)
-2. Gift with purchase promotions
-3. Trade marketing activities
-
-Example forecast:
-Forecasting Line: LOP Revitalift Cream
-Channel: OFFLINE
-Time series: 5. FOC Qty
-
-[Y0 (u) M3]: 2000  (Sampling campaign for new variant)
-[Y0 (u) M6]: 3000  (Mid-year trade promotion - FOC for retailers)
-[Y0 (u) M12]: 5000 (Year-end gift with purchase campaign)
-
-Other months: 0 (no FOC planned)
-```
+**Price Source:**
+- Standard price from SAP material master
+- Or actual transaction price from order
+- Currency: VND
 
 ---
 
-### 1.5. Total Qty (6. Total Qty)
+### 3.2. FORECAST DATA (CPD)
 
-**Nguồn dữ liệu:**
+#### 3.2.1. Forecast Sell-Out - Unit
 
-| Source | Calculation | Priority |
-|--------|-------------|----------|
-| Auto-calculated | Sum of all time series | Always calculated |
+**Nguồn Dữ Liệu:**
 
-**Mapping Logic:**
+| Source | Type | Description |
+|--------|------|-------------|
+| **User Input** | Manual | Demand planner nhập trong WF Excel |
+| **M-1 Reference** | Historical | Forecast tháng trước (reference) |
+| **Baseline** | Calculated | Based on historical trends |
 
-```sql
--- TOTAL QTY CALCULATION
--- Auto-calculated, not from input source
-UPDATE wf
-SET wf.Quantity =
-    ISNULL(baseline.Quantity, 0) +
-    ISNULL(promo.Quantity, 0) +
-    ISNULL(launch.Quantity, 0) +
-    ISNULL(foc.Quantity, 0)
-FROM WF_Master wf
-LEFT JOIN (
-    SELECT Sub_Group, Channel, Period, Quantity
-    FROM WF_Master
-    WHERE Time_Series = '1. Baseline Qty'
-) baseline ON wf.Sub_Group = baseline.Sub_Group
-          AND wf.Channel = baseline.Channel
-          AND wf.Period = baseline.Period
-LEFT JOIN (
-    SELECT Sub_Group, Channel, Period, Quantity
-    FROM WF_Master
-    WHERE Time_Series = '2. Promo Qty'
-) promo ON wf.Sub_Group = promo.Sub_Group
-       AND wf.Channel = promo.Channel
-       AND wf.Period = promo.Period
-LEFT JOIN (
-    SELECT Sub_Group, Channel, Period, Quantity
-    FROM WF_Master
-    WHERE Time_Series = '4. Launch Qty'
-) launch ON wf.Sub_Group = launch.Sub_Group
-        AND wf.Channel = launch.Channel
-        AND wf.Period = launch.Period
-LEFT JOIN (
-    SELECT Sub_Group, Channel, Period, Quantity
-    FROM WF_Master
-    WHERE Time_Series = '5. FOC Qty'
-) foc ON wf.Sub_Group = foc.Sub_Group
-     AND wf.Channel = foc.Channel
-     AND wf.Period = foc.Period
-WHERE wf.Time_Series = '6. Total Qty'
-  AND wf.Division = @Division
-  AND wf.FM_KEY = @FM_KEY
-```
+**Rules:**
 
-**Formula:**
+CPD không forecast SO trực tiếp. Forecast chủ yếu là SI (Sell-In).
 
-```
-Total Qty = Baseline Qty + Promo Qty + Launch Qty + FOC Qty
-```
-
-**Example:**
-
-```
-Forecasting Line: LOP Revitalift Cream
-Channel: ONLINE
-Period: Y0_M2 (Feb 2025)
-
-1. Baseline Qty: 5000
-2. Promo Qty:    1000 (Tet campaign)
-4. Launch Qty:   0    (not a launch period)
-5. FOC Qty:      500  (sampling)
-────────────────────
-6. Total Qty:    6500 (auto-calculated)
-```
-
-**Validation:**
-
-```sql
--- Validation query to ensure Total Qty integrity
-SELECT
-    Sub_Group,
-    Channel,
-    Period,
-    Baseline_Qty,
-    Promo_Qty,
-    Launch_Qty,
-    FOC_Qty,
-    Total_Qty,
-    (Baseline_Qty + Promo_Qty + Launch_Qty + FOC_Qty) AS Calculated_Total,
-    CASE
-        WHEN Total_Qty = (Baseline_Qty + Promo_Qty + Launch_Qty + FOC_Qty)
-        THEN 'OK'
-        ELSE 'ERROR'
-    END AS Validation_Status
-FROM WF_Summary_View
-WHERE Validation_Status = 'ERROR'
-```
+**Output Columns:**
+- Chủ yếu là SI forecast columns
+- SO forecast (nếu có) từ calculations
 
 ---
 
-## 2. Channel Mapping
+#### 3.2.2. Forecast Sell-In - Unit (CPD MAIN FORECAST)
 
-### 2.1. ONLINE Channel
+**Nguồn Dữ Liệu:**
 
-**Nguồn dữ liệu:**
+| Source | File/Procedure | Description |
+|--------|----------------|-------------|
+| **FM File** | `sp_add_FC_FM_Tmp` | FM forecast from Excel |
+| **User WF Input** | Excel WF sheet | Manual forecast input |
+| **BOM Explosion** | `sp_Update_Bom_Header_New` | Bundle → Components |
 
-| Source | Table/File | Mapping Field | Rule |
-|--------|------------|---------------|------|
-| Customer Master | `Customer_Master` | `Channel` | `Channel = 'ONLINE'` |
-| Historical SO | `Historical_SO` | `Customer_Code` | Join with Customer_Master |
-
-**Mapping Logic:**
-
-```sql
--- ONLINE Channel mapping
-SELECT
-    sm.Sub_Group,
-    'ONLINE' AS Channel,
-    Time_Series,
-    Period,
-    SUM(so.SO_Qty) AS Quantity
-FROM Historical_SO so
-INNER JOIN Spectrum_Master sm ON so.Material = sm.Spectrum
-INNER JOIN Customer_Master cm ON so.Customer_Code = cm.Customer_Code
-WHERE cm.Channel = 'ONLINE'  -- E-commerce customers
-  AND cm.Active = 1
-  AND sm.Division = @Division
-GROUP BY sm.Sub_Group, Time_Series, Period
-```
-
-**Online Customer Types:**
-
-| Customer Type | Customer Name Examples | Channel Code |
-|---------------|------------------------|--------------|
-| E-commerce Platforms | Shopee, Lazada, Tiki, Sendo | ONLINE |
-| Brand Website | L'Oreal Vietnam Website | ONLINE |
-| Social Commerce | Facebook Shop, Instagram Shop | ONLINE |
-| Online Retailers | Guardian Online, Watsons Online | ONLINE |
-
-**Example:**
-
-```
-Customer_Master:
-Customer_Code: 2000456
-Customer_Name: SHOPEE VIETNAM
-Channel: ONLINE  ← Online customer
-Active: 1
-
-Historical_SO:
-Material: 3600542410311
-Customer_Code: 2000456  ← Links to SHOPEE
-Order_Type: ZOR
-Month: 2024-01-01
-SO_Qty: 800 units
-
-↓ Mapping ↓
-
-Output (WF):
-Forecasting Line: LOP Revitalift Cream
-Channel: ONLINE  ← Mapped from Customer_Master
-Time series: 1. Baseline Qty
-[Y-1 (u) M1]: 800
-```
-
----
-
-### 2.2. OFFLINE Channel
-
-**Nguồn dữ liệu:**
-
-| Source | Table/File | Mapping Field | Rule |
-|--------|------------|---------------|------|
-| Customer Master | `Customer_Master` | `Channel` | `Channel IN ('GT', 'MT', 'PHARMA', 'SALON')` |
-| Historical SO | `Historical_SO` | `Customer_Code` | Join with Customer_Master |
-
-**Mapping Logic:**
+**Rule Mapping:**
 
 ```sql
--- OFFLINE Channel mapping
+-- Import FM forecast
+EXEC sp_add_FC_FM_Tmp
+    @Division = 'CPD',
+    @FM_KEY = '202501',  -- Jan 2025
+    @filename = 'CPD_FM_202501.xlsx'
+
+-- Structure in FM file:
 SELECT
-    sm.Sub_Group,
-    'OFFLINE' AS Channel,
-    Time_Series,
-    Period,
-    SUM(so.SO_Qty) AS Quantity
-FROM Historical_SO so
-INNER JOIN Spectrum_Master sm ON so.Material = sm.Spectrum
-INNER JOIN Customer_Master cm ON so.Customer_Code = cm.Customer_Code
-WHERE cm.Channel IN ('GT', 'MT', 'PHARMA', 'SALON')  -- Physical stores
-  AND cm.Active = 1
-  AND sm.Division = @Division
-GROUP BY sm.Sub_Group, Time_Series, Period
+    [SKU Code],  -- Spectrum code
+    [SUB GROUP/ Brand],
+    [Channel],
+    [Time series],  -- Baseline, Promo, Launch, FOC, Total
+    [Y0 (u) M1] through [Y0 (u) M12],  ← Forecast Unit Y0
+    [Y+1 (u) M1] through [Y+1 (u) M12]  ← Forecast Unit Y+1
+FROM FC_FM_CPD_202501_Tmp
 ```
 
-**Offline Channel Types:**
+**Time Series trong CPD:**
 
-| Sub-Channel | Full Name | Customer Examples | Channel Code |
-|-------------|-----------|-------------------|--------------|
-| **GT** | General Trade | Small retailers, grocery stores | OFFLINE |
-| **MT** | Modern Trade | CO.OP Mart, BigC, Lotte Mart, Vinmart | OFFLINE |
-| **PHARMA** | Pharmacy | Guardian, Pharmacity, Medicare | OFFLINE |
-| **SALON** | Professional Salon | Hair salons, beauty salons | OFFLINE |
+| Time Series | Source | Rule |
+|-------------|--------|------|
+| **1. Baseline Qty** | User input | Regular sales forecast |
+| **2. Promo Qty** | User input + Promo Calendar | Promotional incremental |
+| **4. Launch Qty** | User input | New product launch (first 3 months) |
+| **5. FOC Qty** | User input | Free of charge forecast |
+| **6. Total Qty** | Calculated | = 1 + 2 + 4 + 5 |
 
-**Example:**
-
-```
-Customer_Master:
-Customer_Code: 1000123
-Customer_Name: CO.OP MART HCM
-Channel: MT  ← Modern Trade (physical store)
-Active: 1
-
-Historical_SO:
-Material: 3600542410311
-Customer_Code: 1000123  ← Links to CO.OP MART
-Order_Type: ZOR
-Month: 2024-01-01
-SO_Qty: 1500 units
-
-↓ Mapping ↓
-
-Output (WF):
-Forecasting Line: LOP Revitalift Cream
-Channel: OFFLINE  ← Mapped from Customer_Master (MT → OFFLINE)
-Time series: 1. Baseline Qty
-[Y-1 (u) M1]: 1500
-```
-
----
-
-### 2.3. O+O Channel (Online + Offline)
-
-**Nguồn dữ liệu:**
-
-| Source | Calculation | Priority |
-|--------|-------------|----------|
-| Auto-calculated | Sum of ONLINE + OFFLINE | Always calculated |
-
-**Mapping Logic:**
-
+**BOM Explosion:**
 ```sql
--- O+O Channel aggregation
-INSERT INTO WF_Master (Division, Sub_Group, Channel, Time_Series, Period, Quantity, Source)
-SELECT
-    Division,
-    Sub_Group,
-    'O+O' AS Channel,
-    Time_Series,
-    Period,
-    SUM(Quantity) AS Quantity,
-    'Auto_Calculated' AS Source
-FROM WF_Master
-WHERE Channel IN ('ONLINE', 'OFFLINE')
-  AND Division = @Division
-  AND FM_KEY = @FM_KEY
-GROUP BY Division, Sub_Group, Time_Series, Period
-```
-
-**Formula:**
-
-```
-O+O Qty = ONLINE Qty + OFFLINE Qty
-```
-
-**Example:**
-
-```
-Forecasting Line: LOP Revitalift Cream
-Time series: 1. Baseline Qty
-Period: Y0_M1 (Jan 2025)
-
-ONLINE:  5000 units
-OFFLINE: 8000 units
-────────────────────
-O+O:    13000 units (auto-calculated)
-
-Channel Split:
-ONLINE:  5000 / 13000 = 38.5%
-OFFLINE: 8000 / 13000 = 61.5%
-```
-
-**Usage:**
-
-O+O is used for:
-- Budget comparison (Budget is usually at O+O level)
-- Total market view
-- FM Export (can export O+O consolidated)
-- Executive reporting
-
----
-
-## 3. Period/Column Mapping
-
-### 3.1. Historical Periods (Y-2, Y-1, Past Y0)
-
-**Nguồn dữ liệu:**
-
-| Source | Table | Date Field | Period Range |
-|--------|-------|------------|--------------|
-| Historical SO | `Historical_SO` | `Month` | Last 24 months from FM_KEY |
-| Historical SI | `Historical_SI` (ZV14) | `Delivery_Date` | Last 24 months |
-
-**Mapping Logic:**
-
-```sql
--- Historical period mapping
--- FM_KEY = CPD_2025_01 (January 2025)
--- Base date = 2025-01-01
-
-DECLARE @FM_Date DATE = '2025-01-01'  -- From FM_KEY
-DECLARE @BaseYear INT = YEAR(@FM_Date)
-
--- Y-2 columns (2023)
--- [Y-2 (u) M1] = Jan 2023, [Y-2 (u) M2] = Feb 2023, ...
-SELECT
-    Sub_Group,
-    Channel,
-    Time_Series,
-    MONTH(Period) AS Month_Num,
-    '[Y-2 (u) M' + CAST(MONTH(Period) AS VARCHAR) + ']' AS Column_Name,
-    Quantity
-FROM Historical_Data
-WHERE YEAR(Period) = @BaseYear - 2  -- 2023
-
--- Y-1 columns (2024)
--- [Y-1 (u) M1] = Jan 2024, [Y-1 (u) M2] = Feb 2024, ...
-SELECT
-    Sub_Group,
-    Channel,
-    Time_Series,
-    MONTH(Period) AS Month_Num,
-    '[Y-1 (u) M' + CAST(MONTH(Period) AS VARCHAR) + ']' AS Column_Name,
-    Quantity
-FROM Historical_Data
-WHERE YEAR(Period) = @BaseYear - 1  -- 2024
-
--- Y0 historical (Jan 2025 if FM is Jan 2025, nothing if FM is also Jan)
--- Past months of current year only
-SELECT
-    Sub_Group,
-    Channel,
-    Time_Series,
-    MONTH(Period) AS Month_Num,
-    '[Y0 (u) M' + CAST(MONTH(Period) AS VARCHAR) + ']' AS Column_Name,
-    Quantity
-FROM Historical_Data
-WHERE YEAR(Period) = @BaseYear  -- 2025
-  AND Period < @FM_Date  -- Before FM month
-```
-
-**Example:**
-
-```
-FM_KEY: CPD_2025_03 (March 2025)
-FM_Date: 2025-03-01
-
-Historical periods:
-Y-2 (2023):
-[Y-2 (u) M1]: Jan 2023 data
-[Y-2 (u) M2]: Feb 2023 data
-...
-[Y-2 (u) M12]: Dec 2023 data
-
-Y-1 (2024):
-[Y-1 (u) M1]: Jan 2024 data
-[Y-1 (u) M2]: Feb 2024 data
-...
-[Y-1 (u) M12]: Dec 2024 data
-
-Y0 (2025, past months only):
-[Y0 (u) M1]: Jan 2025 data (historical, completed)
-[Y0 (u) M2]: Feb 2025 data (historical, completed)
-[Y0 (u) M3]: (blank, current month - not historical yet)
-```
-
-**Data Source:**
-
-```
-Historical_SO table:
-Material: 3600542410311
-Month: 2024-01-01
-SO_Qty: 1500
-
-↓ When FM_KEY = CPD_2025_01 ↓
-
-Mapped to column:
-[Y-1 (u) M1]: 1500  (Jan 2024 is Y-1 relative to 2025)
-```
-
----
-
-### 3.2. Forecast Periods (Y0 Current+, Y+1)
-
-**Nguồn dữ liệu:**
-
-| Source | Table | Input Method |
-|--------|-------|--------------|
-| User Input | `WF_Master` (Excel) | Manual entry in green cells |
-| M-1 Forecast | `FC_FM_History` | Previous month reference |
-| System Suggestion | Calculated | Based on trends, seasonality |
-
-**Mapping Logic:**
-
-```sql
--- Forecast period mapping
--- FM_KEY = CPD_2025_01 (January 2025)
-
-DECLARE @FM_Date DATE = '2025-01-01'
-DECLARE @BaseYear INT = YEAR(@FM_Date)
-DECLARE @CurrentMonth INT = MONTH(@FM_Date)
-
--- Y0 forecast columns (current month onwards)
--- [Y0 (u) M1], [Y0 (u) M2], ..., [Y0 (u) M12]
--- Editable from current month onwards
-
--- Y+1 forecast columns (next year)
--- [Y+1 (u) M1] = Jan 2026, [Y+1 (u) M2] = Feb 2026, ...
--- All editable
-```
-
-**Example:**
-
-```
-FM_KEY: CPD_2025_01 (January 2025)
-
-Y0 Forecast (2025):
-[Y0 (u) M1]: User input (Jan 2025) - editable (current month)
-[Y0 (u) M2]: User input (Feb 2025) - editable
-[Y0 (u) M3]: User input (Mar 2025) - editable
-...
-[Y0 (u) M12]: User input (Dec 2025) - editable
-
-Y+1 Forecast (2026):
-[Y+1 (u) M1]: User input (Jan 2026) - editable
-[Y+1 (u) M2]: User input (Feb 2026) - editable
-...
-[Y+1 (u) M12]: User input (Dec 2026) - editable
-```
-
-**User Input in Excel:**
-
-```
-Forecasting Line: LOP Revitalift Cream
-Channel: ONLINE
-Time series: 1. Baseline Qty
-
-User enters:
-[Y0 (u) M2]: 5000  ← Feb 2025 forecast
-[Y0 (u) M3]: 5200  ← Mar 2025 forecast
-[Y0 (u) M4]: 5500  ← Apr 2025 forecast
-...
-```
-
----
-
-## 4. Calculation Fields Mapping
-
-### 4.1. AVE P3M (Average Previous 3 Months)
-
-**Nguồn dữ liệu:**
-
-| Source | Calculation | Period |
-|--------|-------------|--------|
-| Historical SO | Average of last 3 completed months | Rolling 3 months |
-
-**Mapping Logic:**
-
-```sql
--- AVE P3M calculation
-WITH Last_3_Months AS (
+-- If product is Bundle
+IF EXISTS (SELECT 1 FROM FC_BOM_Header WHERE Bundle_Spectrum = @Material)
+BEGIN
+    -- Explode bundle forecast to components
+    INSERT INTO FC_FM_Original_CPD (...)
     SELECT
-        sm.Sub_Group,
-        Channel,
-        so.Month,
-        SUM(so.SO_Qty) AS Monthly_Qty,
-        ROW_NUMBER() OVER (PARTITION BY sm.Sub_Group, Channel
-                          ORDER BY so.Month DESC) AS Month_Rank
-    FROM Historical_SO so
-    INNER JOIN Spectrum_Master sm ON so.Material = sm.Spectrum
-    WHERE so.Month < @FM_Date  -- Completed months only
-      AND so.Status = 'C'
-    GROUP BY sm.Sub_Group, Channel, so.Month
-)
+        Component_Spectrum,
+        Bundle_Forecast_Qty * Component_Qty_Per_Bundle
+    FROM FC_BOM_Header
+    WHERE Bundle_Spectrum = @Material
+END
+```
+
+**Output Columns:**
+- `[Y0 (u) M1]` to `[Y0 (u) M12]` ← Editable forecast Y0
+- `[Y+1 (u) M1]` to `[Y+1 (u) M12]` ← Editable forecast Y+1
+
+---
+
+### 3.3. CPD-Specific Features
+
+**3.3.1. BOM (Bill of Materials)**
+
+CPD có nhiều bundle products:
+- Gift sets
+- Promo packs
+- Multi-product bundles
+
+**Process:**
+1. User forecast bundle quantity
+2. System explodes to components using BOM
+3. Component forecast = Direct + From BOM
+
+**3.3.2. FOC (Free of Charge)**
+
+CPD tracks FOC separately:
+- Samples for marketing
+- Gift with purchase
+- Trade promotions
+
+---
+
+## 4. LDB Division
+
+### 4.1. HISTORICAL DATA
+
+#### 4.1.1. Historical Sell-Out (SO) - Unit
+
+**Nguồn Dữ Liệu:**
+
+| Source | File/Procedure | Table | Special |
+|--------|----------------|-------|---------|
+| **Optimus** | `sp_add_FC_SO_OPTIMUS_NORMAL_LDB_Tmp.sql` | `FC_SO_OPTIMUS_NORMAL_LDB` | LDB-specific |
+| **Conversion** | `sp_fc_convert_SO_LDB_SO.sql` | `FC_LDB_SO_HIS_FINAL` | **Special conversion** |
+
+**⭐ LDB SPECIAL RULES:**
+
+```sql
+-- LDB có conversion procedure riêng
+EXEC sp_fc_convert_SO_LDB_SO
+    @Division = 'LDB'
+
+-- Conversion logic:
 SELECT
-    Sub_Group,
+    Material,
+    PeriodKey,
+    -- LDB có category-specific conversions
+    CASE Category
+        WHEN 'Dermatology' THEN SellOut * Conversion_Factor_Dermo
+        WHEN 'Professional' THEN SellOut * Conversion_Factor_Pro
+        ELSE SellOut
+    END AS Converted_SellOut
+FROM Raw_SO_Data
+```
+
+**LDB Categories:**
+- Dermatology (La Roche-Posay, Vichy, CeraVe)
+- Professional (Kérastase, Redken)
+- Each category có conversion rules riêng
+
+**Filters:**
+- ✅ Same general filters as CPD
+- ✅ **Plus**: Category-specific validations
+- ✅ **Plus**: Professional channel rules
+
+---
+
+#### 4.1.2. Historical Sell-In (SI) - Unit
+
+**Nguồn Dữ Liệu:**
+
+| Source | File/Procedure | Special |
+|--------|----------------|---------|
+| **ZV14** | `sp_add_FC_SI_OPTIMUS_NORMAL_Tmp` | Standard |
+| **Conversion** | `sp_fc_convert_SO_LDB_SI.sql` | **LDB-specific conversion** |
+
+**LDB SI Conversion:**
+
+```sql
+EXEC sp_fc_convert_SO_LDB_SI
+    @Division = 'LDB'
+
+-- Conversion includes:
+-- 1. Professional product allocations
+-- 2. Salon vs Retail split
+-- 3. Dermatology channel specifics
+```
+
+**LDB Channels:**
+- **Pharma**: Pharmacies (main channel for dermo)
+- **Salon**: Professional salons (for hair care)
+- **Retail**: General retail (limited)
+- **Online**: E-commerce
+
+---
+
+### 4.2. FORECAST DATA (LDB)
+
+#### 4.2.1. Forecast Sell-In - Unit
+
+**Nguồn Dữ Liệu:**
+
+| Source | Description |
+|--------|-------------|
+| **FM File** | Standard FM import |
+| **SI Template** | `sp_add_FC_SI_Template_Tmp` - LDB uses SI template |
+
+**LDB-Specific Rules:**
+
+```sql
+-- LDB forecast by channel
+Channel Rules:
+├─ PHARMA (60-70% of LDB)
+│  └─ Focus on dermatology brands
+├─ SALON (20-30% of LDB)
+│  └─ Professional hair care
+└─ RETAIL/ONLINE (10-20%)
+```
+
+**LDB Time Series:**
+
+Same as CPD but with different emphasis:
+- **Baseline**: Larger proportion (stable dermo sales)
+- **Promo**: Smaller (less promotions in pharma)
+- **Launch**: Significant (new dermo products)
+- **FOC**: Medical samples
+
+---
+
+## 5. LLD Division
+
+### 5.1. HISTORICAL DATA
+
+#### 5.1.1. Historical Sell-Out (SO) - Unit
+
+**Nguồn Dữ Liệu:**
+
+| Source | File/Procedure | Table |
+|--------|----------------|-------|
+| **Optimus** | `sp_add_FC_SO_OPTIMUS_NORMAL_Tmp` | `FC_SO_OPTIMUS_NORMAL_LLD` |
+| **Processed** | Standard | `FC_LLD_SO_HIS_FINAL` |
+| **Final** | `fnc_FC_SO_HIS_FINAL('LLD')` | Function output |
+
+**LLD Rules:**
+
+```sql
+-- LLD (Luxury) has simpler structure than CPD/LDB
+SELECT
+    Material,
+    PeriodKey,
     Channel,
-    AVG(Monthly_Qty) AS AVE_P3M
-FROM Last_3_Months
-WHERE Month_Rank <= 3  -- Last 3 months
-GROUP BY Sub_Group, Channel
+    SellOut_Unit = SUM(Quantity)
+FROM FC_SO_OPTIMUS_NORMAL_LLD
+WHERE Division = 'LLD'
+  -- LLD specific: High-value, low-volume
+  AND Unit_Price > 500000  -- Example threshold for luxury
+GROUP BY Material, PeriodKey, Channel
+```
+
+**LLD Characteristics:**
+- High unit price, low volume
+- Premium channels focus
+- Less promotional activity
+- Strong brand focus (YSL, Lancôme, Armani, etc.)
+
+---
+
+#### 5.1.2. Historical Sell-In (SI) - Unit
+
+**Nguồn Dữ Liệu:**
+
+Standard ZV14 import, no special conversion for LLD.
+
+```sql
+EXEC sp_add_FC_SI_OPTIMUS_NORMAL_Tmp
+    @Division = 'LLD',
+    @filename = 'ZV14_LLD_YYYYMMDD.xlsx'
+```
+
+**LLD SI Rules:**
+- Direct from ZV14
+- Focus on premium channels
+- High-value orders
+- Strict quality control
+
+---
+
+### 5.2. FORECAST DATA (LLD)
+
+#### 5.2.1. Forecast Baseline - LLD SPECIFIC
+
+**⭐ Nguồn Dữ Liệu:**
+
+| Source | File/Procedure | Description |
+|--------|----------------|-------------|
+| **FM (FuturMaster)** | `sp_add_FC_FM_Tmp` | Main forecast from FuturMaster tool |
+| **FM Non-Modeling** | `sp_add_FC_FM_Non_Modeling_Tmp` | Manual adjustments outside model |
+
+**LLD Baseline Mapping:**
+
+```sql
+-- LLD uses 2 sources for Baseline
+-- 1. FM (FuturMaster) - Modeling-based forecast
+EXEC sp_add_FC_FM_Tmp
+    @Division = 'LLD',
+    @FM_KEY = '202501',
+    @filename = 'LLD_FM_202501.xlsx'
+
+-- 2. FM Non-Modeling - Manual adjustments
+EXEC sp_add_FC_FM_Non_Modeling_Tmp
+    @Division = 'LLD',
+    @FM_KEY = '202501',
+    @filename = 'LLD_FM_Non_Modeling_202501.xlsx'
+
+-- Combine both sources
+INSERT INTO FC_FM_Original_LLD
+SELECT
+    ...,
+    Baseline_Unit =
+        ISNULL(FM_Modeling.Baseline, 0) +  ← From FuturMaster model
+        ISNULL(FM_Non_Modeling.Baseline, 0)  ← Manual adjustments
+FROM ...
+```
+
+**Rule:**
+```
+LLD Baseline = FM (Modeling) + FM Non-Modeling (Manual Adjustments)
+
+Where:
+- FM (Modeling): Statistical forecast from FuturMaster tool
+- FM Non-Modeling: Expert adjustments for:
+  * New launches not in model
+  * Market events
+  * Strategic decisions
 ```
 
 **Example:**
-
 ```
-FM_KEY: CPD_2025_01 (January 2025)
-Current date: 2025-01-15
+Product: YSL Lipstick
+Period: Y0_M3 (Mar 2025)
 
-Last 3 completed months:
+FM (Modeling) forecast: 500 units (based on trends)
+FM Non-Modeling adjustment: +100 units (new campaign)
+-----------------------
+Total Baseline: 600 units
+```
+
+---
+
+#### 5.2.2. LLD Time Series
+
+| Time Series | LLD Source | Notes |
+|-------------|------------|-------|
+| **1. Baseline Qty** | FM + FM Non-Modeling | **Main forecast method** |
+| **2. Promo Qty** | User input (limited) | Less promo in luxury |
+| **4. Launch Qty** | FM Non-Modeling mainly | New luxury products |
+| **5. FOC Qty** | User input | Samples, gifts |
+| **6. Total Qty** | Calculated | Sum of all |
+
+---
+
+## 6. Calculation Fields
+
+### 6.1. SOH (Stock on Hand)
+
+**Nguồn Dữ Liệu:**
+
+| Source | File/Procedure | Table | Update Frequency |
+|--------|----------------|-------|------------------|
+| **SAP ZMR32** | `sp_create_SOH_FINAL.sql` | `V_SOH_RAW` | Daily |
+| **Processed** | Multiple procedures | `FC_SOH_FINAL` | Daily |
+
+**Rule Mapping:**
+
+```sql
+-- Daily import from SAP
+-- Source: ZMR32 report from SAP
+
+SELECT
+    Material,
+    Plant,
+    Storage_Location,
+    Batch,
+    SOH_Quantity = SUM(Stock_Quantity),  ← Unit
+    SOH_Value = SUM(Stock_Value)  ← Value (VND)
+FROM SAP_ZMR32_Import
+WHERE Stock_Type IN ('UNRESTRICTED', 'QUALITY_INSPECTION')
+  -- Exclude blocked stock
+  AND Stock_Type NOT IN ('BLOCKED', 'RETURNS')
+GROUP BY Material, Plant, Storage_Location, Batch
+
+-- Aggregate to Sub_Group level for WF
+SELECT
+    sm.Sub_Group,
+    SOH_Total = SUM(soh.SOH_Quantity)
+FROM SOH_Detail soh
+INNER JOIN fnc_SubGroupMaster(@Division, 'full') sm
+    ON soh.Material = sm.Spectrum
+GROUP BY sm.Sub_Group
+```
+
+**Filters:**
+- ✅ Stock Type = Unrestricted or Quality Inspection
+- ❌ Exclude: Blocked stock, Returns, Transit stock
+- ✅ Current stock only (not historical)
+
+**Output:**
+- WF Column: `[SOH]` (单独列)
+- Unit: Units (pieces, bottles, etc.)
+- Aggregation: By Sub_Group
+
+**Example:**
+```
+Sub_Group: LOP Revitalift Cream
+
+Material 1 (50ml): 10000 units
+Material 2 (30ml): 5000 units
+Material 3 (100ml): 3000 units
+------------------------
+SOH (WF): 18000 units (total for Sub_Group)
+```
+
+---
+
+### 6.2. SIT (Stock in Transit)
+
+**Nguồn Dữ Liệu:**
+
+Calculated field, not direct source.
+
+**Rule:**
+
+```sql
+-- Formula
+SIT = SOH - GIT_M0
+
+Where:
+- SOH: Stock on Hand (current physical stock)
+- GIT_M0: Goods in Transit arriving this month
+```
+
+**Procedure:**
+
+```sql
+-- From sp_tag_update_wf_sit_NEW
+UPDATE wf
+SET wf.SIT =
+    ISNULL(soh.SOH_Quantity, 0) -
+    ISNULL(git.GIT_M0, 0)
+FROM FC_FM_Original_{Division} wf
+LEFT JOIN SOH_Summary soh ON wf.[SUB GROUP/ Brand] = soh.Sub_Group
+LEFT JOIN GIT_Summary git ON wf.[SUB GROUP/ Brand] = git.Sub_Group
+```
+
+**Purpose:**
+- SIT = "Available stock" after deducting incoming goods
+- Used for stock coverage calculation
+- Important for supply planning
+
+**Output:**
+- WF Column: `[SIT]`
+- Can be negative if GIT > SOH (rare case)
+
+---
+
+### 6.3. GIT (Goods in Transit)
+
+**Nguồn Dữ Liệu:**
+
+| Source | File/Procedure | Table | Update Frequency |
+|--------|----------------|-------|------------------|
+| **SAP GIT Report** | `sp_add_FC_GIT_Tmp.sql` | `FC_GIT` | Daily |
+| **Processed** | `sp_FC_GIT_New.sql` | GIT processed | Daily |
+
+**Rule Mapping:**
+
+```sql
+-- Import from SAP GIT report
+EXEC sp_add_FC_GIT_Tmp
+    @Division = @Division,
+    @filename = 'GIT_YYYYMMDD.xlsx'
+
+-- Structure
+SELECT
+    Material,
+    Division,
+    GIT_M0 = SUM(CASE WHEN Arrival_Month = CURRENT_MONTH THEN Quantity ELSE 0 END),
+    GIT_M1 = SUM(CASE WHEN Arrival_Month = CURRENT_MONTH + 1 THEN Quantity ELSE 0 END),
+    GIT_M2 = SUM(CASE WHEN Arrival_Month = CURRENT_MONTH + 2 THEN Quantity ELSE 0 END),
+    GIT_M3 = SUM(CASE WHEN Arrival_Month = CURRENT_MONTH + 3 THEN Quantity ELSE 0 END)
+FROM FC_GIT_Import
+GROUP BY Material, Division
+```
+
+**GIT Periods:**
+- **GIT M0**: Arriving current month
+- **GIT M1**: Arriving next month
+- **GIT M2**: Arriving in 2 months
+- **GIT M3**: Arriving in 3 months
+
+**Output Columns:**
+- `[GIT M0]`, `[GIT M1]`, `[GIT M2]`, `[GIT M3]`
+- `[Total GIT]` = Sum of M0-M3
+
+**Example:**
+```
+Product: LOP UV Perfect
+Current month: January 2025
+
+GIT M0 (Jan): 2000 units (arriving this month)
+GIT M1 (Feb): 1500 units
+GIT M2 (Mar): 1000 units
+GIT M3 (Apr): 500 units
+-----------------
+Total GIT: 5000 units
+```
+
+---
+
+### 6.4. Risk & SLOB
+
+#### 6.4.1. SLOB (Slow-moving/Obsolete)
+
+**Nguồn Dữ Liệu:**
+
+Calculated field.
+
+**Rule:**
+
+```sql
+-- From sp_tag_update_slob_wf
+-- Formula
+Stock_Coverage_Months = SOH / AVE_P3M
+
+SLOB_Risk =
+    CASE
+        WHEN AVE_P3M = 0 AND SOH > 0 THEN 'DEAD_STOCK'
+        WHEN Stock_Coverage_Months > 3 THEN 'HIGH'
+        WHEN Stock_Coverage_Months > 2 THEN 'MEDIUM'
+        ELSE 'LOW'
+    END
+
+Where:
+- AVE_P3M = Average SO of previous 3 months
+```
+
+**Procedure:**
+
+```sql
+UPDATE wf
+SET
+    wf.Stock_Coverage =
+        CASE
+            WHEN wf.[AVE P3M Y0] > 0
+            THEN wf.SOH / wf.[AVE P3M Y0]
+            ELSE 999
+        END,
+    wf.SLOB =
+        CASE
+            WHEN wf.[AVE P3M Y0] = 0 AND wf.SOH > 0 THEN 'DEAD_STOCK'
+            WHEN wf.SOH / NULLIF(wf.[AVE P3M Y0], 0) > 3 THEN 'HIGH'
+            WHEN wf.SOH / NULLIF(wf.[AVE P3M Y0], 0) > 2 THEN 'MEDIUM'
+            ELSE 'LOW'
+        END
+FROM FC_FM_Original_{Division} wf
+```
+
+**Output:**
+- WF Column: `[SLOB]` (text: HIGH/MEDIUM/LOW/DEAD_STOCK)
+- Basis: Stock coverage calculation
+
+**Example:**
+```
+SOH: 15000 units
+AVE P3M: 2000 units/month
+
+Stock Coverage = 15000 / 2000 = 7.5 months
+SLOB Risk: HIGH  ← Over 3 months
+
+Action needed: Reduce orders, run promotions
+```
+
+---
+
+#### 6.4.2. 3-Month Risk
+
+**Rule:**
+
+```sql
+-- Compare Forecast next 3M vs Historical previous 3M
+Risk_Status =
+    CASE
+        WHEN AVE_F3M < AVE_P3M * 0.7 THEN 'HIGH_DECLINE'  -- Down >30%
+        WHEN AVE_F3M > AVE_P3M * 1.3 THEN 'HIGH_GROWTH'   -- Up >30%
+        ELSE 'NORMAL'
+    END
+
+Where:
+- AVE_P3M: Average previous 3 months (actual)
+- AVE_F3M: Average forecast 3 months
+```
+
+**Purpose:**
+- Identify risky forecast changes
+- Flag for review if variance > ±30%
+
+---
+
+### 6.5. MTD SI (Month-to-Date Sell-In)
+
+**Nguồn Dữ Liệu:**
+
+| Source | Update | Description |
+|--------|--------|-------------|
+| **ZV14 Daily** | Daily | Current month SI accumulation |
+
+**Rule:**
+
+```sql
+-- From sp_tag_update_wf_mtd_si_NEW
+SELECT
+    Material,
+    MTD_SI = SUM(Delivery_Quantity)
+FROM FC_SI_OPTIMUS_NORMAL_{Division}
+WHERE YEAR(Delivery_Date) = YEAR(GETDATE())
+  AND MONTH(Delivery_Date) = MONTH(GETDATE())
+  -- From start of month to today
+  AND Delivery_Date <= GETDATE()
+  AND Order_Status = 'C'
+GROUP BY Material
+```
+
+**Output:**
+- WF Column: `[MTD SI]`
+- Updates daily as new orders complete
+- Used for in-month tracking
+
+**Example:**
+```
+Current date: Jan 15, 2025
+Month forecast: 10000 units
+
+MTD SI (Jan 1-15): 4500 units
+Expected MTD (50% of month): 5000 units (10000 × 15/30)
+Status: Slightly behind (-10%)
+```
+
+---
+
+### 6.6. AVE P3M & AVE F3M
+
+#### AVE P3M (Average Previous 3 Months)
+
+**Rule:**
+
+```sql
+-- From calculation
+SELECT
+    Sub_Group,
+    AVE_P3M_Y0 = AVG(Monthly_SO)
+FROM (
+    SELECT
+        Sub_Group,
+        Period,
+        SUM(SellOut) AS Monthly_SO,
+        ROW_NUMBER() OVER (PARTITION BY Sub_Group ORDER BY Period DESC) AS rn
+    FROM Historical_SO
+    WHERE Period < CURRENT_PERIOD
+) AS Last3M
+WHERE rn <= 3
+GROUP BY Sub_Group
+```
+
+**Example:**
+```
+Current: Jan 2025
+Previous 3 months:
 - Dec 2024: 8000 units
 - Nov 2024: 7500 units
 - Oct 2024: 7800 units
 
 AVE P3M = (8000 + 7500 + 7800) / 3 = 7767 units
-
-Output in WF:
-Forecasting Line: LOP Revitalift Cream
-Channel: ONLINE
-AVE P3M: 7767
 ```
 
-**Purpose:**
-- Baseline reference for forecasting
-- 3M Risk assessment comparison
-- Trend analysis
+#### AVE F3M (Average Forecast 3 Months)
 
----
-
-### 4.2. AVE F3M (Average Forecast 3 Months)
-
-**Nguồn dữ liệu:**
-
-| Source | Calculation | Period |
-|--------|-------------|--------|
-| User Forecast | Average of next 3 forecast months | Forward looking 3 months |
-
-**Mapping Logic:**
+**Rule:**
 
 ```sql
--- AVE F3M calculation
-WITH Next_3_Months AS (
+-- Next 3 months forecast average
+SELECT
+    Sub_Group,
+    AVE_F3M_Y0 = AVG(Monthly_Forecast)
+FROM (
     SELECT
         Sub_Group,
-        Channel,
         Period,
-        Quantity AS Forecast_Qty,
-        ROW_NUMBER() OVER (PARTITION BY Sub_Group, Channel
-                          ORDER BY Period ASC) AS Month_Rank
-    FROM WF_Master
-    WHERE Period >= @FM_Date  -- Future months
-      AND Time_Series = '6. Total Qty'
-      AND Channel = 'O+O'
-)
-SELECT
-    Sub_Group,
-    Channel,
-    AVG(Forecast_Qty) AS AVE_F3M
-FROM Next_3_Months
-WHERE Month_Rank <= 3  -- Next 3 months
-GROUP BY Sub_Group, Channel
-```
-
-**Example:**
-
-```
-FM_KEY: CPD_2025_01 (January 2025)
-
-Next 3 forecast months:
-- Jan 2025 (Y0_M1): 8500 units (forecast)
-- Feb 2025 (Y0_M2): 9000 units (forecast)
-- Mar 2025 (Y0_M3): 9200 units (forecast)
-
-AVE F3M = (8500 + 9000 + 9200) / 3 = 8900 units
-
-Output in WF:
-AVE F3M: 8900
-
-Comparison:
-AVE P3M: 7767
-AVE F3M: 8900
-Growth: +14.6%
-```
-
----
-
-### 4.3. SOH (Stock on Hand)
-
-**Nguồn dữ liệu:**
-
-| Source | Table | Field | Update Frequency |
-|--------|-------|-------|------------------|
-| SAP ZMR32 | `Stock_ZMR32` | `SOH_Qty` | Daily |
-
-**Mapping Logic:**
-
-```sql
--- SOH mapping
-SELECT
-    sm.Sub_Group,
-    SUM(soh.Quantity) AS SOH_Qty
-FROM Stock_ZMR32 soh
-INNER JOIN Spectrum_Master sm ON soh.Material = sm.Spectrum
-WHERE sm.Division = @Division
-  AND sm.Status = 'ACTIVE'
-  AND soh.Stock_Date = (SELECT MAX(Stock_Date) FROM Stock_ZMR32)  -- Latest stock
-GROUP BY sm.Sub_Group
-```
-
-**Example:**
-
-```
-Stock_ZMR32 table:
-Material: 3600542410311 (LOP Revitalift Cream 50ml)
-Plant: 1000
-Quantity: 10000 units
-Stock_Date: 2025-01-15
-
-Material: 3600542410328 (LOP Revitalift Cream 30ml)
-Plant: 1000
-Quantity: 5000 units
-Stock_Date: 2025-01-15
-
-↓ Aggregation by Sub_Group ↓
-
-Output in WF:
-Forecasting Line: LOP Revitalift Cream
-SOH: 15000 units (10000 + 5000, aggregated from all SKUs in sub-group)
-```
-
----
-
-### 4.4. GIT (Goods in Transit)
-
-**Nguồn dữ liệu:**
-
-| Source | Table | Fields | Update Frequency |
-|--------|-------|--------|------------------|
-| SAP GIT Report | `GIT_Data` | `GIT_M0`, `GIT_M1`, `GIT_M2`, `GIT_M3` | Daily |
-
-**Mapping Logic:**
-
-```sql
--- GIT mapping
-SELECT
-    sm.Sub_Group,
-    SUM(git.Quantity_M0) AS GIT_M0,
-    SUM(git.Quantity_M1) AS GIT_M1,
-    SUM(git.Quantity_M2) AS GIT_M2,
-    SUM(git.Quantity_M3) AS GIT_M3
-FROM GIT_Data git
-INNER JOIN Spectrum_Master sm ON git.Material = sm.Spectrum
-WHERE sm.Division = @Division
-  AND git.Update_Date = (SELECT MAX(Update_Date) FROM GIT_Data)  -- Latest GIT
-GROUP BY sm.Sub_Group
-```
-
-**Example:**
-
-```
-GIT_Data table:
-Material: 3600542410311
-Quantity_M0: 2000  ← In transit for current month
-Quantity_M1: 1500  ← In transit for next month
-Quantity_M2: 1000
-Quantity_M3: 500
-Update_Date: 2025-01-15
-
-↓ Mapping ↓
-
-Output in WF:
-Forecasting Line: LOP Revitalift Cream
-GIT M0: 2000
-GIT M1: 1500
-GIT M2: 1000
-GIT M3: 500
-```
-
----
-
-### 4.5. SLOB Risk
-
-**Nguồn dữ liệu:**
-
-| Source | Calculation | Formula |
-|--------|-------------|---------|
-| SOH + AVE P3M | Stock coverage analysis | `SOH / AVE_P3M` |
-
-**Mapping Logic:**
-
-```sql
--- SLOB Risk calculation
-SELECT
-    Sub_Group,
-    SOH,
-    AVE_P3M,
-    CASE
-        WHEN AVE_P3M = 0 AND SOH > 0 THEN 'DEAD_STOCK'
-        WHEN SOH / NULLIF(AVE_P3M, 0) > 3 THEN 'HIGH'
-        WHEN SOH / NULLIF(AVE_P3M, 0) > 2 THEN 'MEDIUM'
-        ELSE 'LOW'
-    END AS SLOB_Risk,
-    SOH / NULLIF(AVE_P3M, 0) AS Stock_Coverage_Months
-FROM WF_Calculation_View
-WHERE Division = @Division
-```
-
-**Example:**
-
-```
-Forecasting Line: LOP Revitalift Cream
-SOH: 15000 units
-AVE P3M: 2000 units/month
-
-Stock Coverage = 15000 / 2000 = 7.5 months
-
-SLOB Risk: HIGH  (> 3 months)
-
-Interpretation:
-At current sales rate (2000/month), stock will last 7.5 months
-→ Slow-moving, consider clearance actions
-```
-
----
-
-### 4.6. BP Gap %
-
-**Nguồn dữ liệu:**
-
-| Source | Calculation | Formula |
-|--------|-------------|---------|
-| Forecast + Budget | Variance analysis | `(Forecast - Budget) / Budget × 100` |
-
-**Mapping Logic:**
-
-```sql
--- BP Gap % calculation
-SELECT
-    fc.Sub_Group,
-    fc.Period,
-    fc.Forecast_Qty,
-    bdg.Budget_Qty,
-    fc.Forecast_Qty - bdg.Budget_Qty AS Gap_Abs,
-    (fc.Forecast_Qty - bdg.Budget_Qty) / NULLIF(bdg.Budget_Qty, 0) * 100 AS BP_Gap_Pct
-FROM (
-    SELECT Sub_Group, Period, SUM(Quantity) AS Forecast_Qty
-    FROM WF_Master
-    WHERE Channel = 'O+O' AND Time_Series = '6. Total Qty'
-    GROUP BY Sub_Group, Period
-) fc
-INNER JOIN FC_Budget bdg ON fc.Sub_Group = bdg.Sub_Group
-                         AND fc.Period = bdg.Period
-```
-
-**Example:**
-
-```
-Forecasting Line: LOP Revitalift Cream
-Period: Y0_M2 (Feb 2025)
-
-Budget: 10000 units
-Forecast: 11500 units
-
-Gap (Abs): 11500 - 10000 = +1500 units
-BP Gap %: (1500 / 10000) × 100 = +15.0%
-
-Output in WF:
-BP Gap %: +15.0% (over budget)
-```
-
----
-
-## 5. Budget Fields Mapping
-
-### 5.1. Budget (B_Y0, B_Y+1)
-
-**Nguồn dữ liệu:**
-
-| Source | Table/File | Upload By | Frequency |
-|--------|------------|-----------|-----------|
-| Finance Team | `FC_Budget` (Excel upload) | Finance | Yearly |
-
-**Mapping Logic:**
-
-```sql
--- Budget mapping
-SELECT
-    Division,
-    Sub_Group,
-    Channel,  -- Usually O+O level
-    Period,
-    Budget_Qty,
-    Budget_Type,  -- 'Budget', 'Pre-Budget', 'Trend1', etc.
-    Upload_Date,
-    Upload_By
-FROM FC_Budget
-WHERE Division = @Division
-  AND Budget_Type = 'Budget'  -- Official budget
-  AND YEAR(Period) IN (@BaseYear, @BaseYear + 1)  -- Y0 and Y+1
-```
-
-**Column Mapping:**
-
-```
-Budget file columns:
-[B_Y0_M1], [B_Y0_M2], ..., [B_Y0_M12]  ← Budget for current year
-[B_Y+1_M1], [B_Y+1_M2], ..., [B_Y+1_M12]  ← Budget for next year
-```
-
-**Example:**
-
-```
-FC_Budget table:
-Division: CPD
-Sub_Group: LOP Revitalift Cream
-Channel: O+O
-Period: 2025-02-01
-Budget_Qty: 10000
-Budget_Type: Budget
-Upload_Date: 2024-12-15
-Upload_By: finance.user
-
-↓ Mapping ↓
-
-Output in WF:
-Forecasting Line: LOP Revitalift Cream
-Channel: O+O
-[B_Y0_M2]: 10000  (Feb 2025 budget)
-```
-
----
-
-### 5.2. Pre-Budget (PB_Y+1)
-
-**Nguồn dữ liệu:**
-
-| Source | Table/File | Upload By | Frequency |
-|--------|------------|-----------|-----------|
-| Finance Team | `FC_Budget` | Finance | Yearly (draft) |
-
-**Mapping Logic:**
-
-```sql
--- Pre-Budget mapping
-SELECT
-    Division,
-    Sub_Group,
-    Channel,
-    Period,
-    Budget_Qty AS PreBudget_Qty,
-    Upload_Date
-FROM FC_Budget
-WHERE Division = @Division
-  AND Budget_Type = 'Pre-Budget'  -- Draft budget
-  AND YEAR(Period) = @BaseYear + 1  -- Usually for Y+1 only
-```
-
-**Example:**
-
-```
-FC_Budget table:
-Division: CPD
-Sub_Group: LOP Revitalift Cream
-Period: 2026-01-01
-Budget_Qty: 11000
-Budget_Type: Pre-Budget
-Upload_Date: 2024-10-15
-
-↓ Mapping ↓
-
-Output in WF:
-[PB_Y+1_M1]: 11000  (Jan 2026 pre-budget)
-```
-
----
-
-### 5.3. Trends (T1, T2, T3)
-
-**Nguồn dữ liệu:**
-
-| Source | Table/File | Scenarios | Purpose |
-|--------|------------|-----------|---------|
-| Finance/Planning | `FC_Budget` | Conservative / Base / Optimistic | Scenario planning |
-
-**Mapping Logic:**
-
-```sql
--- Trend scenarios mapping
-SELECT
-    Division,
-    Sub_Group,
-    Period,
-    MAX(CASE WHEN Budget_Type = 'Trend1' THEN Budget_Qty END) AS T1_Qty,  -- Conservative
-    MAX(CASE WHEN Budget_Type = 'Trend2' THEN Budget_Qty END) AS T2_Qty,  -- Base
-    MAX(CASE WHEN Budget_Type = 'Trend3' THEN Budget_Qty END) AS T3_Qty   -- Optimistic
-FROM FC_Budget
-WHERE Division = @Division
-  AND Budget_Type IN ('Trend1', 'Trend2', 'Trend3')
-GROUP BY Division, Sub_Group, Period
-```
-
-**Scenarios:**
-
-| Trend | Scenario | Typical % vs Budget | Use Case |
-|-------|----------|---------------------|----------|
-| **T1** | Conservative | -10% to -15% | Worst case scenario |
-| **T2** | Base | ±5% | Most likely scenario |
-| **T3** | Optimistic | +10% to +15% | Best case scenario |
-
-**Example:**
-
-```
-FC_Budget table:
-Sub_Group: LOP Revitalift Cream
-Period: 2025-02-01
-
-Budget_Type: Trend1 → Budget_Qty: 8500  (Conservative)
-Budget_Type: Trend2 → Budget_Qty: 10000 (Base)
-Budget_Type: Trend3 → Budget_Qty: 11500 (Optimistic)
-
-↓ Mapping ↓
-
-Output in WF:
-[T1_Y0_M2]: 8500
-[T2_Y0_M2]: 10000
-[T3_Y0_M2]: 11500
-
-Forecast comparison:
-Forecast: 10200
-Closest to: T2 (Base scenario)
-```
-
----
-
-## 6. Master Data Fields Mapping
-
-### 6.1. Product Type
-
-**Nguồn dữ liệu:**
-
-| Source | Table | Field |
-|--------|-------|-------|
-| Spectrum Master | `Spectrum_Master` | `Product_Type` |
-
-**Values:**
-
-```sql
-Product_Type IN ('Finished Good', 'Bundle', 'Promo Pack', 'Sample')
-```
-
-**Mapping:**
-
-```
-Spectrum_Master:
-Spectrum: 3600542410311
-Product_Type: Finished Good
-
-↓ Display in WF ↓
-
-Product type column: Finished Good
-```
-
----
-
-### 6.2. Forecasting Line (Sub Group)
-
-**Nguồn dữ liệu:**
-
-| Source | Table | Field |
-|--------|-------|-------|
-| Spectrum Master | `Spectrum_Master` | `Sub_Group` |
-
-**Mapping:**
-
-```sql
--- Sub_Group mapping
-SELECT DISTINCT
-    Sub_Group AS Forecasting_Line
-FROM Spectrum_Master
-WHERE Division = @Division
-  AND Status = 'ACTIVE'
-ORDER BY Sub_Group
-```
-
-**Example:**
-
-```
-Spectrum_Master:
-Spectrum: 3600542410311
-Product_Name: L'Oreal Paris Revitalift Cream 50ml
-Brand: L'Oreal Paris
-Sub_Brand: Revitalift
-Sub_Group: LOP Revitalift Cream  ← Forecasting Line
-
-↓ Display in WF ↓
-
-Forecasting Line column: LOP Revitalift Cream
+        Forecast_Qty AS Monthly_Forecast,
+        ROW_NUMBER() OVER (PARTITION BY Sub_Group ORDER BY Period ASC) AS rn
+    FROM Forecast_Data
+    WHERE Period >= CURRENT_PERIOD
+) AS Next3M
+WHERE rn <= 3
+GROUP BY Sub_Group
 ```
 
 ---
 
 ## 7. Complete Mapping Matrix
 
-### 7.1. Field-to-Source Matrix
+### 7.1. Division Comparison
 
-| WF Field | Primary Source | Secondary Source | Calculation | Editable | Color |
-|----------|----------------|------------------|-------------|----------|-------|
-| **Product type** | Spectrum_Master.Product_Type | - | - | No | White |
-| **Forecasting Line** | Spectrum_Master.Sub_Group | - | - | No | White |
-| **Channel** | Customer_Master.Channel → ONLINE/OFFLINE | - | - | No | White |
-| **Channel (O+O)** | - | - | ONLINE + OFFLINE | No | White |
-| **Time series** | Row label | - | - | No | White |
-| **[Y-2 (u) M1-M12]** | Historical_SO (2 years ago) | - | - | No | Blue |
-| **[Y-1 (u) M1-M12]** | Historical_SO (last year) | - | - | No | Blue |
-| **[Y0 (u) M1-Mcurrent]** | Historical_SO (completed months) | - | - | No | Blue |
-| **[Y0 (u) Mcurrent-M12]** | User Input (Excel) | M-1 Forecast | - | Yes | Green |
-| **[Y+1 (u) M1-M12]** | User Input (Excel) | - | - | Yes | Green |
-| **[B_Y0_M1-M12]** | FC_Budget (Budget_Type='Budget') | - | - | No | Yellow |
-| **[B_Y+1_M1-M12]** | FC_Budget (Budget_Type='Budget') | - | - | No | Yellow |
-| **[PB_Y+1_M1-M12]** | FC_Budget (Budget_Type='Pre-Budget') | - | - | No | Yellow |
-| **[T1/T2/T3_Y0_M1-M12]** | FC_Budget (Budget_Type='Trend1/2/3') | - | - | No | Yellow |
-| **[M-1_Y0_M1-M12]** | FC_FM_History (previous FM) | - | - | No | Gray |
-| **AVE P3M** | - | - | AVG(last 3M actual) | No | Orange |
-| **AVE F3M** | - | - | AVG(next 3M forecast) | No | Orange |
-| **MTD SI** | Historical_SI (current month) | - | SUM(SI MTD) | No | Orange |
-| **SOH** | Stock_ZMR32.Quantity | - | SUM by Sub_Group | No | Orange |
-| **SIT** | - | - | SOH - GIT_M0 | No | Orange |
-| **GIT M0-M3** | GIT_Data.Quantity_M0-M3 | - | SUM by Sub_Group | No | Orange |
-| **SLOB Risk** | - | - | SOH / AVE_P3M | No | Orange |
-| **BP Gap %** | - | - | (FC-BDG)/BDG×100 | No | Orange |
+| Data Type | CPD | LDB | LLD |
+|-----------|-----|-----|-----|
+| **SO Historical Source** | Optimus Standard | Optimus + Conversion (`sp_fc_convert_SO_LDB_SO`) | Optimus Standard |
+| **SI Historical Source** | ZV14 Standard | ZV14 + Conversion (`sp_fc_convert_SO_LDB_SI`) | ZV14 Standard |
+| **Forecast Main Source** | FM + User Input | FM + SI Template | **FM + FM Non-Modeling** |
+| **BOM Complexity** | High (many bundles) | Medium | Low |
+| **Promo Activity** | High | Low (pharma restrictions) | Low (luxury positioning) |
+| **Main Channel** | MT/GT (Retail) | Pharma/Salon | Premium Retail/Online |
 
-### 7.2. Time Series Source Matrix
+### 7.2. File Import Summary
 
-| Time Series | Historical Source | Forecast Source | Key Filter | Order Type |
-|-------------|-------------------|-----------------|------------|------------|
-| **1. Baseline Qty** | Historical_SO | User Input | `Order_Type='ZOR'` AND not in promo period | ZOR |
-| **2. Promo Qty** | Historical_SO | User Input + Promo_Calendar | `Order_Type='ZPROMO'` OR in promo period | ZPROMO |
-| **4. Launch Qty** | Historical_SO | User Input + Launch_Plan | `Order_Type='ZLAUNCH'` OR within 3M of Launch_Date | ZLAUNCH |
-| **5. FOC Qty** | Historical_SO | User Input | `Order_Type='ZFOC'` | ZFOC |
-| **6. Total Qty** | - | Calculated | Sum of 1+2+4+5 | - |
+| Division | Historical SO | Historical SI | Forecast | Special |
+|----------|---------------|---------------|----------|---------|
+| **CPD** | `sp_add_FC_SO_OPTIMUS_NORMAL_Tmp` | `sp_add_FC_SI_OPTIMUS_NORMAL_Tmp` | `sp_add_FC_FM_Tmp` | BOM heavy |
+| **LDB** | `sp_add_FC_SO_OPTIMUS_NORMAL_LDB_Tmp` + Conversion | `sp_add_FC_SI_OPTIMUS_NORMAL_Tmp` + Conversion | `sp_add_FC_FM_Tmp` + SI Template | Category conversion |
+| **LLD** | `sp_add_FC_SO_OPTIMUS_NORMAL_Tmp` | `sp_add_FC_SI_OPTIMUS_NORMAL_Tmp` | `sp_add_FC_FM_Tmp` + **FM Non-Modeling** | Dual forecast source |
 
-### 7.3. Channel Source Matrix
+### 7.3. Column Type Summary
 
-| Channel | Source Filter | Customer Types | Examples |
-|---------|---------------|----------------|----------|
-| **ONLINE** | `Customer_Master.Channel='ONLINE'` | E-commerce, Social commerce | Shopee, Lazada, Tiki |
-| **OFFLINE** | `Customer_Master.Channel IN ('GT','MT','PHARMA','SALON')` | Physical stores | CO.OP, BigC, Guardian |
-| **O+O** | Calculated: ONLINE + OFFLINE | All channels | - |
+| Column Pattern | Data Type | Source | Editable | Example |
+|----------------|-----------|--------|----------|---------|
+| `[Y-2 (u) M*]` | Historical SO Unit | Optimus | No (Read-only) | [Y-2 (u) M1] = 1500 |
+| `[Y-1 (u) M*]` | Historical SO Unit | Optimus | No | [Y-1 (u) M6] = 1800 |
+| `[Y0 (u) M*]` | Historical/Forecast Unit | Optimus + FM | Mixed | Past: No, Future: Yes |
+| `[Y+1 (u) M*]` | Forecast Unit | FM + User | Yes | [Y+1 (u) M3] = 2000 |
+| `[(Value)_Y-2 (u) M*]` | Historical SO Value | Optimus | No | [(Value)_Y-2 (u) M1] = 45M VND |
+| `[(Value)_Y0 (u) M*]` | Historical/Forecast Value | Calculated | Mixed | Unit × Price |
+| `[B_Y0_M*]` | Budget Unit | Finance upload | No | [B_Y0_M1] = 1900 |
+| `[(Value)_B_Y0_M*]` | Budget Value | Finance upload | No | [(Value)_B_Y0_M1] = 57M VND |
+| `[SOH]` | Stock on Hand | ZMR32 Daily | No | SOH = 18000 |
+| `[GIT M0]` | Goods in Transit M0 | GIT Daily | No | GIT M0 = 2000 |
+| `[SIT]` | Stock in Transit | Calculated | No | SIT = SOH - GIT M0 |
+| `[SLOB]` | Risk Level | Calculated | No | SLOB = HIGH |
+| `[MTD SI]` | Month-to-Date SI | ZV14 Daily | No | MTD SI = 4500 |
+| `[AVE P3M Y0]` | Avg Previous 3M | Calculated | No | AVE P3M = 7767 |
+| `[AVE F3M Y0]` | Avg Forecast 3M | Calculated | No | AVE F3M = 8900 |
 
 ---
 
-## 8. Data Flow Examples
+## 8. Division-Specific Notes
 
-### Example 1: Complete Flow for Baseline Qty
+### CPD Notes
 
+✅ **Strengths:**
+- Comprehensive BOM system
+- High promo activity
+- Detailed time series breakdown
+
+⚠️ **Complexity:**
+- Many bundle products
+- Complex BOM explosions
+- High FOC volume
+
+### LDB Notes
+
+✅ **Strengths:**
+- Category-specific logic
+- Professional channel focus
+- Stable demand patterns
+
+⚠️ **Special Requirements:**
+- Conversion procedures mandatory
+- Pharma channel compliance
+- Salon allocation rules
+
+### LLD Notes
+
+✅ **Strengths:**
+- Dual forecast sources (FM + FM Non-Modeling)
+- Flexibility for luxury market
+- Brand-focused approach
+
+⚠️ **Special Requirements:**
+- **Must use both FM sources for Baseline**
+- Manual adjustments critical
+- Premium channel focus
+
+---
+
+## 9. Quick Reference
+
+### Finding Data Source for a Field
+
+**Question: "Column X lấy từ đâu?"**
+
+**Answer Steps:**
+1. Identify column pattern (e.g., `[Y-1 (u) M3]`)
+2. Check Section 7.3 (Column Type Summary)
+3. Find Division (CPD/LDB/LLD)
+4. Go to specific Division section
+5. Check Historical vs Forecast
+6. See detailed mapping rules
+
+**Example:**
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ STEP 1: RAW DATA (SAP)                                      │
-├─────────────────────────────────────────────────────────────┤
-│ Historical_SO:                                               │
-│ Material: 3600542410311                                     │
-│ Customer_Code: 1000123                                      │
-│ Order_Type: ZOR                                             │
-│ Month: 2024-01-01                                           │
-│ SO_Qty: 1500                                                │
-│ Status: C                                                   │
-└─────────────────────────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────────────────────────┐
-│ STEP 2: MASTER DATA ENRICHMENT                              │
-├─────────────────────────────────────────────────────────────┤
-│ Spectrum_Master:                                            │
-│ Spectrum: 3600542410311 → Sub_Group: "LOP Revitalift Cream"│
-│ Product_Type: "Finished Good"                               │
-│                                                              │
-│ Customer_Master:                                            │
-│ Customer_Code: 1000123 → Channel: "MT" → "OFFLINE"        │
-└─────────────────────────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────────────────────────┐
-│ STEP 3: TIME SERIES CLASSIFICATION                          │
-├─────────────────────────────────────────────────────────────┤
-│ Order_Type: ZOR                                             │
-│ Check Promo_Calendar: Not in promo period                  │
-│ → Time_Series: "1. Baseline Qty"                           │
-└─────────────────────────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────────────────────────┐
-│ STEP 4: PERIOD MAPPING                                      │
-├─────────────────────────────────────────────────────────────┤
-│ Month: 2024-01-01                                           │
-│ FM_KEY: CPD_2025_01 (base year 2025)                       │
-│ → Column: [Y-1 (u) M1] (Jan 2024 is Y-1 from 2025)        │
-└─────────────────────────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────────────────────────┐
-│ STEP 5: AGGREGATION                                         │
-├─────────────────────────────────────────────────────────────┤
-│ GROUP BY: Sub_Group + Channel + Time_Series + Period       │
-│ SUM: SO_Qty                                                 │
-└─────────────────────────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────────────────────────┐
-│ STEP 6: OUTPUT TO WF                                        │
-├─────────────────────────────────────────────────────────────┤
-│ Product type: Finished Good                                 │
-│ Forecasting Line: LOP Revitalift Cream                      │
-│ Channel: OFFLINE                                            │
-│ Time series: 1. Baseline Qty                                │
-│ [Y-1 (u) M1]: 1500                                         │
-└─────────────────────────────────────────────────────────────┘
-```
+Q: LLD Baseline forecast (Y0_M3) lấy từ đâu?
 
-### Example 2: Promo Qty with Calendar Check
+Steps:
+1. Column: [Y0 (u) M3] → Forecast Unit
+2. Division: LLD
+3. Go to Section 5.2.1 (LLD Forecast Baseline)
+4. Answer: FM (Modeling) + FM Non-Modeling
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│ INPUT 1: Historical_SO                                      │
-├─────────────────────────────────────────────────────────────┤
-│ Material: 3600542410311                                     │
-│ Order_Type: ZOR  ← Normal order                            │
-│ Month: 2024-02-05                                           │
-│ SO_Qty: 2500                                                │
-└─────────────────────────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────────────────────────┐
-│ INPUT 2: Promo_Calendar                                     │
-├─────────────────────────────────────────────────────────────┤
-│ Promo_ID: PROMO_2024_02_TET                                │
-│ Sub_Group: LOP Revitalift Cream                             │
-│ Start_Date: 2024-02-01                                      │
-│ End_Date: 2024-02-29                                        │
-│ Status: CONFIRMED                                           │
-└─────────────────────────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────────────────────────┐
-│ LOGIC: Check if order falls in promo period                │
-├─────────────────────────────────────────────────────────────┤
-│ Order_Date: 2024-02-05                                      │
-│ Promo_Start: 2024-02-01                                     │
-│ Promo_End: 2024-02-29                                       │
-│ → YES, in promo period                                      │
-│ → Override: Time_Series = "2. Promo Qty"                   │
-└─────────────────────────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────────────────────────┐
-│ OUTPUT TO WF                                                │
-├─────────────────────────────────────────────────────────────┤
-│ Forecasting Line: LOP Revitalift Cream                      │
-│ Channel: OFFLINE                                            │
-│ Time series: 2. Promo Qty  ← Classified as promo          │
-│ [Y-1 (u) M2]: 2500                                         │
-└─────────────────────────────────────────────────────────────┘
+Sources:
+- sp_add_FC_FM_Tmp ('LLD', '202501', 'LLD_FM_202501.xlsx')
+- sp_add_FC_FM_Non_Modeling_Tmp ('LLD', '202501', 'LLD_FM_Non_Modeling_202501.xlsx')
+
+Rule: Baseline = FM + FM Non-Modeling
 ```
 
 ---
 
-**Document Version:** 1.0
+**Document Version:** 2.0 (Division-Specific)
 **Last Updated:** 2025-11-18
 **Maintained by:** Technical Team
 
 **Related Documents:**
-- [DATA_FLOW_OVERVIEW.md](./DATA_FLOW_OVERVIEW.md) - Tổng quan luồng dữ liệu
-- [INPUT_DATA_SPECIFICATION.md](./INPUT_DATA_SPECIFICATION.md) - Chi tiết input
-- [DATA_MAPPING_PROCESS.md](./DATA_MAPPING_PROCESS.md) - Quy trình mapping
-- [BUSINESS_LOGIC_FLOW.md](./BUSINESS_LOGIC_FLOW.md) - Logic nghiệp vụ
-- [OUTPUT_SPECIFICATION.md](./OUTPUT_SPECIFICATION.md) - Kết quả output
+- [DATA_FLOW_OVERVIEW.md](./DATA_FLOW_OVERVIEW.md) - Tổng quan hệ thống
+- [INPUT_DATA_SPECIFICATION.md](./INPUT_DATA_SPECIFICATION.md) - Chi tiết inputs
+- [BUSINESS_LOGIC_FLOW.md](./BUSINESS_LOGIC_FLOW.md) - Business logic
+- [OUTPUT_SPECIFICATION.md](./OUTPUT_SPECIFICATION.md) - Outputs
+- [README.md](./README.md) - Documentation index
