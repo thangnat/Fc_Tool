@@ -1,0 +1,12 @@
+﻿<?xml version='1.0' encoding='utf-8'?>
+<SettingsFile xmlns="http://schemas.microsoft.com/VisualStudio/2004/01/settings" CurrentProfile="(Default)" GeneratedClassNamespace="EXCEL_ADDINS.Properties" GeneratedClassName="Settings">
+  <Profiles />
+  <Settings>
+    <Setting Name="AccessDB" Type="System.String" Scope="User">
+      <Value Profile="(Default)">Provider=Microsoft.ACE.OLEDB.12.0;Data Source= C:\phuongho\PROJECT\DESIGN\CSharp\FC\FC_Addins\EXCEL_ADDINS\bin\Debug\\FC_SysData.mdb; Jet OLEDB:Database Password=123</Value>
+    </Setting>
+    <Setting Name="FC_Version_Guid" Type="System.String" Scope="User">
+      <Value Profile="(Default)">5D636FD3-8106-4BE8-969D-44891479145C</Value>
+    </Setting>
+  </Settings>
+</SettingsFile>

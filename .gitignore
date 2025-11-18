@@ -1,0 +1,69 @@
+# Ignore Windows thumbnail cache files
+Thumbs.db
+
+# Ignore Visual Studio temporary files, build results, and VS Code folders
+.vs/
+*.user
+*.suo
+*.cache
+*.log
+*.pdb
+*.obj
+*.dll
+*.exe
+*.tlb
+*.tlh
+*.idb
+*.ilk
+*.ipch
+*.iobj
+*.ipdb
+*.tlog
+*.log
+*.lastbuildstate
+!handle.exe
+*.opensdf
+*.sdf
+*.dbmdl
+*.opendb
+*.VC.db
+
+# Ignore NuGet packages
+*.nupkg
+packages/
+
+# Ignore VBA files (compiled and temporary files)
+*.exd
+~$*.xls*
+~$*.xlt*
+~$*.dot*
+~$*.doc*
+
+# Ignore JetBrains Rider files
+.idea/
+
+# Ignore test results
+TestResults/
+
+# Ignore publish and deploy folders
+bin/
+obj/
+AppPackages/
+
+# Ignore Resharper files
+*_Resharper*/
+*.DotSettings.user
+
+# Ignore SQL Server database files
+*.mdf
+*.ldf
+
+# Ignore user-specific files
+*.vsconfig
+*.csproj.user
+.DS_Store
+SC1Tools/files/
+FC Build/Application Files
+publish
+.cr
+.venv
